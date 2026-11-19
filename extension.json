@@ -1,0 +1,56 @@
+{
+    "id": "breefer-player-manager",
+    "name": "Breefer Player Manager",
+    "version": "1.2.0",
+    "description": "Minecraft player dashboard: online players, inventories, stats, moderation, teleport, titles, server tools (weather, time, game rules, broadcast) and a server.properties editor.",
+    "author": "Shine Akhanda",
+    "website": null,
+    "update_url": null,
+    "api_version": "RCYL_v26",
+    "target_version": "canary",
+    "backend": {
+        "routes": {
+            "client": {
+                "file": "backend/routes/client.php",
+                "middleware": []
+            },
+            "admin": {
+                "file": "backend/routes/admin.php",
+                "middleware": []
+            }
+        },
+        "commands": [],
+        "schedules": [],
+        "providers": [],
+        "boot_hooks": [
+            "backend/hooks/boot.php"
+        ]
+    },
+    "frontend": {
+        "build_strategy": "source",
+        "entry_points": [],
+        "slots": [],
+        "routes": {
+            "dashboardRouter": [],
+            "serverRouter": [
+                {
+                    "path": "players",
+                    "label": "Players",
+                    "module": "frontend/src/PlayersPage.tsx",
+                    "export": "default",
+                    "permission": "file.read-content",
+                    "icon": "icon:RiUserGroup"
+                }
+            ]
+        },
+        "source": {
+            "entry": "frontend/src/PlayersPage.tsx",
+            "entries": [
+                "frontend/src/breefer-ui.tsx"
+            ]
+        }
+    },
+    "assets": [],
+    "permissions": [],
+    "feature_flags": []
+}
