@@ -2,30 +2,12 @@ const React = window.React;
 if (!React) throw new Error('window.React is not available for extension module rendering.');
 
 import { Alert, Badge, Button, Card, ConfirmButton, Empty, Field, Input, Loading, Modal, Page, Select, Tabs, api, getServerId, timeAgo, toastErr, toastOk, } from './breefer-ui.js';
+import InventoryManager from './InventoryManager.js';
 const { useState, useEffect, useMemo } = React;
 const base = () => `/api/client/extensions/breefer-player-manager/servers/${getServerId()}`;
-const avatar = (p, size = 32) => `https://mc-heads.net/avatar/${encodeURIComponent(p.uuid ?? p.name ?? 'MHF_Steve')}/${size}`;
+// 3D isometric player heads
+const avatar = (p, size = 32) => `https://mc-heads.net/head/${encodeURIComponent(p.uuid ?? p.name ?? 'MHF_Steve')}/${size * 2}`;
 const pretty = (id) => id.replace(/^minecraft:/, '').replace(/_/g, ' ');
-function ItemTile(props) {
-    const [src, setSrc] = useState(0);
-    const item = props.item;
-    const short = item ? item.id.replace(/^[^:]+:/, '') : '';
-    const sources = item ? [`https://assets.mcasset.cloud/1.21.4/assets/minecraft/textures/item/${short}.png`, `https://assets.mcasset.cloud/1.21.4/assets/minecraft/textures/block/${short}.png`] : [];
-    const title = item
-        ? `${item.name ?? pretty(item.id)} ×${item.count}${item.enchantments.length ? '\n' + item.enchantments.map((e) => `${pretty(e.id)} ${e.level}`).join('\n') : ''}`
-        : props.label ?? '';
-    return (React.createElement("div", { title: title, style: {
-            width: 44, height: 44, borderRadius: 6, background: 'var(--brf-bg2)', border: '1px solid var(--brf-bd2)', position: 'relative',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, color: 'var(--brf-mut)', overflow: 'hidden',
-            boxShadow: item?.enchantments.length ? 'inset 0 0 0 2px color-mix(in srgb, #a855f7 60%, transparent)' : undefined,
-        } },
-        item ? (src < sources.length ? (React.createElement("img", { src: sources[src], width: 32, height: 32, style: { imageRendering: 'pixelated' }, alt: '', onError: () => setSrc(src + 1) })) : (React.createElement("span", { style: { textAlign: 'center', lineHeight: 1.1, padding: 2 } }, short.slice(0, 12)))) : (React.createElement("span", null, props.label)),
-        item && item.count > 1 ? (React.createElement("b", { style: { position: 'absolute', right: 3, bottom: 1, fontSize: 11, color: '#fff', textShadow: '1px 1px 0 #000' } }, item.count)) : null));
-}
-function Grid(props) {
-    const bySlot = new Map(props.items.map((i) => [i.slot ?? -1, i]));
-    return (React.createElement("div", { style: { display: 'grid', gridTemplateColumns: `repeat(${props.cols ?? 9}, 44px)`, gap: 4 } }, Array.from({ length: props.count }, (_, i) => (React.createElement(ItemTile, { key: i, item: bySlot.get(props.from + i) })))));
-}
 function PlayerModal(props) {
     const p = props.player;
     const [details, setDetails] = useState(null);
@@ -43,18 +25,25 @@ function PlayerModal(props) {
     const [xp, setXp] = useState('');
     const [title, setTitle] = useState('');
     const [subtitle, setSubtitle] = useState('');
-    useEffect(() => {
+    const [reloading, setReloading] = useState(false);
+    // Online players: the server saves its player data first, so inventory and position are current.
+    const loadDetails = (fresh) => {
         if (!p.uuid)
-            return;
-        api('GET', `${base()}/players/${p.uuid}`)
+            return Promise.resolve();
+        setReloading(true);
+        return api('GET', `${base()}/players/${p.uuid}${fresh ? '?fresh=1' : ''}`)
             .then(setDetails)
-            .catch((e) => toastErr(e.message));
+            .catch((e) => toastErr(e.message))
+            .finally(() => setReloading(false));
+    };
+    useEffect(() => {
+        loadDetails(p.online && props.overview.can_console);
     }, [p.uuid]);
     const run = async (action, extra = {}, success) => {
         setBusy(action);
         try {
-            await api('POST', base() + '/action', { action, name: p.name, ...extra });
-            toastOk(success ?? `Sent: ${action.replace('_', ' ')} ${p.name}`);
+            const r = await api('POST', base() + '/action', { action, name: p.name, ...extra });
+            toastOk(r?.offline ? r.message : success ?? `Sent: ${action.replace('_', ' ')} ${p.name}`);
             props.onChanged();
         }
         catch (e) {
@@ -78,6 +67,13 @@ function PlayerModal(props) {
     const s = details?.summary;
     const can = (k) => props.overview.allow?.[k] !== false;
     const canAct = props.overview.can_console && !!p.name;
+    // Live edits need the console (and a name for the commands); offline edits change the player file.
+    const editable = can('allow_inventory_edit') && (p.online ? props.overview.can_console && !!p.name : props.overview.can_update !== false);
+    const editHint = !can('allow_inventory_edit')
+        ? 'Inventory editing is disabled by the administrator.'
+        : p.online
+            ? 'Editing an online player needs the console permission.'
+            : 'Editing an offline player needs the file update permission.';
     return (React.createElement(Modal, { open: true, onClose: props.onClose, width: 760 },
         React.createElement("div", { className: 'brf-row', style: { gap: 14, marginBottom: 14 } },
             React.createElement("img", { src: avatar(p, 64), width: 56, height: 56, style: { borderRadius: 8, imageRendering: 'pixelated' }, alt: '' }),
@@ -91,11 +87,11 @@ function PlayerModal(props) {
                         p.op) : null,
                     p.whitelisted ? React.createElement(Badge, { kind: 'ok' }, "whitelisted") : null,
                     p.banned ? React.createElement(Badge, { kind: 'err' }, "banned") : null,
-                    s?.gamemode ? React.createElement(Badge, null, s.gamemode) : null))),
+                    s?.gamemode ? React.createElement(Badge, null, s.gamemode) : null)),
+            p.uuid ? (React.createElement(Button, { size: 'sm', variant: 'ghost', loading: reloading, onClick: () => loadDetails(p.online && props.overview.can_console), title: 'Reload the saved player data' }, "Reload")) : null),
         React.createElement(Tabs, { value: tab, onValue: setTab, tabs: [
                 { key: 'overview', label: 'Overview' },
                 { key: 'inventory', label: 'Inventory' },
-                { key: 'ender', label: 'Ender chest' },
                 { key: 'stats', label: 'Statistics' },
                 { key: 'actions', label: 'Actions' },
             ] }),
@@ -140,14 +136,8 @@ function PlayerModal(props) {
                 " (expires ",
                 p.banned.expires,
                 ")")) : null)) : null,
-        (tab === 'inventory' || tab === 'ender') && details?.inventory_hidden ? React.createElement(Alert, { kind: 'info' }, "Inventory viewing is disabled by the administrator.") : null,
-        tab === 'inventory' && details && !details.error && !details.inventory_hidden ? (React.createElement("div", { className: 'brf-row', style: { alignItems: 'flex-start', gap: 18 } },
-            React.createElement("div", { className: 'brf-col', style: { gap: 4 } }, ['head', 'chest', 'legs', 'feet', 'offhand'].map((slot) => (React.createElement(ItemTile, { key: slot, item: details.equipment[slot], label: slot })))),
-            React.createElement("div", { className: 'brf-col', style: { gap: 10 } },
-                React.createElement(Grid, { items: details.inventory, from: 9, count: 27 }),
-                React.createElement(Grid, { items: details.inventory, from: 0, count: 9 }),
-                React.createElement("span", { className: 'brf-muted' }, "Hover an item for details. Saved data refreshes when the player logs out or the world autosaves.")))) : null,
-        tab === 'ender' && details && !details.error && !details.inventory_hidden ? React.createElement(Grid, { items: details.ender_chest, from: 0, count: 27 }) : null,
+        tab === 'inventory' && details?.inventory_hidden ? React.createElement(Alert, { kind: 'info' }, "Inventory viewing is disabled by the administrator.") : null,
+        tab === 'inventory' && details && !details.error && !details.inventory_hidden && p.uuid ? (React.createElement(InventoryManager, { uuid: p.uuid, name: p.name, online: p.online, inventory: details.inventory, ender: details.ender_chest, equipment: details.equipment, canEdit: editable, editHint: editHint, onChanged: () => loadDetails(p.online && props.overview.can_console) })) : null,
         tab === 'stats' && details ? (details.stats ? (React.createElement("div", { className: 'brf-col' },
             React.createElement("div", { className: 'brf-grid', style: { ['--brf-min']: '140px' } }, [
                 ['Play time', details.stats.play_time_hours + ' h'],
@@ -170,6 +160,9 @@ function PlayerModal(props) {
                     React.createElement("span", null, pretty(e.id)),
                     React.createElement("span", { className: 'brf-muted' }, e.count))))))))))) : (React.createElement(Empty, { title: 'No statistics', text: 'Stats are written when the player has played on this world.' }))) : null,
         tab === 'actions' ? (!canAct ? (React.createElement(Alert, { kind: 'warn' }, "You need console permission (and a known player name) to run actions.")) : (React.createElement("div", { className: 'brf-col' },
+            !props.overview.status.reachable ? (React.createElement(Alert, { kind: 'info', style: { marginBottom: 0 } }, "The server looks stopped. Whitelist, operator and ban changes are written to the server files and apply on the next start; the other actions need the server running.")) : !p.online ? (React.createElement(Alert, { kind: 'info', style: { marginBottom: 0 } },
+                p.name,
+                " is offline. Whitelist, operator and ban actions work; in-game actions (teleport, items, effects, messages) need the player online.")) : null,
             React.createElement("div", { className: 'brf-row' },
                 can('allow_whitelist') ? React.createElement(Button, { size: 'sm', variant: 'sec', loading: busy === (p.whitelisted ? 'whitelist_remove' : 'whitelist_add'), onClick: () => run(p.whitelisted ? 'whitelist_remove' : 'whitelist_add') }, p.whitelisted ? 'Remove from whitelist' : 'Add to whitelist') : null,
                 can('allow_op') ? React.createElement(Button, { size: 'sm', variant: 'sec', loading: busy === (p.op ? 'deop' : 'op'), onClick: () => run(p.op ? 'deop' : 'op') }, p.op ? 'Remove operator' : 'Make operator') : null,
@@ -248,8 +241,8 @@ function ServerTools(props) {
     const send = async (key, action, extra, ok) => {
         setBusy(key);
         try {
-            await api('POST', base() + '/action', { action, ...extra });
-            toastOk(ok);
+            const r = await api('POST', base() + '/action', { action, ...extra });
+            toastOk(r?.offline ? r.message : ok);
             props.onChanged();
         }
         catch (e) {
@@ -310,6 +303,7 @@ const PROPERTY_LABELS = {
     'spawn-protection': 'Spawn protection radius',
     'view-distance': 'View distance (chunks)',
     'simulation-distance': 'Simulation distance (chunks)',
+    'online-mode': 'Online mode (check Mojang accounts; off = offline/cracked mode)',
 };
 function PropertiesEditor() {
     const [data, setData] = useState(null);
@@ -389,8 +383,8 @@ export default function PlayersPage() {
     const refreshSoon = () => setTimeout(load, 1500);
     const command = async (action, extra, ok) => {
         try {
-            await api('POST', base() + '/action', { action, ...extra });
-            toastOk(ok);
+            const r = await api('POST', base() + '/action', { action, ...extra });
+            toastOk(r?.offline ? r.message : ok);
             refreshSoon();
         }
         catch (e) {
@@ -457,7 +451,20 @@ export default function PlayersPage() {
                         " \u00B7 ",
                         overview.properties.difficulty ?? '',
                         " \u00B7 ",
-                        overview.properties.online_mode ? 'online mode' : 'offline mode'))),
+                        overview.properties.online_mode ? 'online mode' : 'offline mode'),
+                    overview.can_update && overview.allow?.allow_properties !== false ? (React.createElement("span", null,
+                        React.createElement(ConfirmButton, { size: 'sm', variant: 'ghost', title: overview.properties.online_mode ? 'Turn offline mode on?' : 'Turn online mode back on?', message: overview.properties.online_mode
+                                ? 'Players will no longer be checked against Mojang accounts (cracked clients can join). Player UUIDs change, so existing players start with new inventories, op and whitelist entries. Restart the server to apply.'
+                                : 'Only real Minecraft accounts can join again. Offline-mode player data is kept but belongs to different UUIDs. Restart the server to apply.', confirmText: overview.properties.online_mode ? 'Turn offline mode on' : 'Turn online mode on', onConfirm: async () => {
+                                try {
+                                    await api('POST', base() + '/properties', { properties: { 'online-mode': overview.properties.online_mode ? 'false' : 'true' } });
+                                    toastOk(`Online mode ${overview.properties.online_mode ? 'off' : 'on'}. Restart the server to apply.`);
+                                    load();
+                                }
+                                catch (e) {
+                                    toastErr(e.message);
+                                }
+                            } }, overview.properties.online_mode ? 'Offline mode: turn on' : 'Online mode: turn on'))) : null)),
             st.motd ? React.createElement(Alert, { kind: 'info' }, st.motd) : null,
             React.createElement(Tabs, { value: view, onValue: setView, tabs: [
                     { key: 'players', label: 'Players' },

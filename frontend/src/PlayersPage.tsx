@@ -3,6 +3,7 @@ import {
     Alert, Badge, Button, Card, ConfirmButton, Empty, Field, Input, Loading, Modal, Page, Select, Tabs,
     api, getServerId, timeAgo, toastErr, toastOk,
 } from './breefer-ui.js';
+import InventoryManager from './InventoryManager.js';
 
 const { useState, useEffect, useMemo } = React;
 
@@ -23,6 +24,7 @@ interface Overview {
     world: string;
     can_console: boolean;
     can_delete: boolean;
+    can_update?: boolean;
     allow?: Record<string, boolean>;
 }
 interface Item {
@@ -49,52 +51,9 @@ interface Details {
 }
 
 const base = () => `/api/client/extensions/breefer-player-manager/servers/${getServerId()}`;
-const avatar = (p: { uuid: string | null; name: string | null }, size = 32) => `https://mc-heads.net/avatar/${encodeURIComponent(p.uuid ?? p.name ?? 'MHF_Steve')}/${size}`;
+// 3D isometric player heads
+const avatar = (p: { uuid: string | null; name: string | null }, size = 32) => `https://mc-heads.net/head/${encodeURIComponent(p.uuid ?? p.name ?? 'MHF_Steve')}/${size * 2}`;
 const pretty = (id: string) => id.replace(/^minecraft:/, '').replace(/_/g, ' ');
-
-function ItemTile(props: { item?: Item; label?: string }) {
-    const [src, setSrc] = useState(0);
-    const item = props.item;
-    const short = item ? item.id.replace(/^[^:]+:/, '') : '';
-    const sources = item ? [`https://assets.mcasset.cloud/1.21.4/assets/minecraft/textures/item/${short}.png`, `https://assets.mcasset.cloud/1.21.4/assets/minecraft/textures/block/${short}.png`] : [];
-    const title = item
-        ? `${item.name ?? pretty(item.id)} ×${item.count}${item.enchantments.length ? '\n' + item.enchantments.map((e) => `${pretty(e.id)} ${e.level}`).join('\n') : ''}`
-        : props.label ?? '';
-    return (
-        <div
-            title={title}
-            style={{
-                width: 44, height: 44, borderRadius: 6, background: 'var(--brf-bg2)', border: '1px solid var(--brf-bd2)', position: 'relative',
-                display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, color: 'var(--brf-mut)', overflow: 'hidden',
-                boxShadow: item?.enchantments.length ? 'inset 0 0 0 2px color-mix(in srgb, #a855f7 60%, transparent)' : undefined,
-            }}
-        >
-            {item ? (
-                src < sources.length ? (
-                    <img src={sources[src]} width={32} height={32} style={{ imageRendering: 'pixelated' }} alt='' onError={() => setSrc(src + 1)} />
-                ) : (
-                    <span style={{ textAlign: 'center', lineHeight: 1.1, padding: 2 }}>{short.slice(0, 12)}</span>
-                )
-            ) : (
-                <span>{props.label}</span>
-            )}
-            {item && item.count > 1 ? (
-                <b style={{ position: 'absolute', right: 3, bottom: 1, fontSize: 11, color: '#fff', textShadow: '1px 1px 0 #000' }}>{item.count}</b>
-            ) : null}
-        </div>
-    );
-}
-
-function Grid(props: { items: Item[]; from: number; count: number; cols?: number }) {
-    const bySlot = new Map(props.items.map((i) => [i.slot ?? -1, i]));
-    return (
-        <div style={{ display: 'grid', gridTemplateColumns: `repeat(${props.cols ?? 9}, 44px)`, gap: 4 }}>
-            {Array.from({ length: props.count }, (_, i) => (
-                <ItemTile key={i} item={bySlot.get(props.from + i)} />
-            ))}
-        </div>
-    );
-}
 
 function PlayerModal(props: { player: Player; overview: Overview; online: string[]; onClose: () => void; onChanged: () => void }) {
     const p = props.player;
@@ -114,18 +73,26 @@ function PlayerModal(props: { player: Player; overview: Overview; online: string
     const [title, setTitle] = useState('');
     const [subtitle, setSubtitle] = useState('');
 
-    useEffect(() => {
-        if (!p.uuid) return;
-        api<Details>('GET', `${base()}/players/${p.uuid}`)
+    const [reloading, setReloading] = useState(false);
+    // Online players: the server saves its player data first, so inventory and position are current.
+    const loadDetails = (fresh: boolean) => {
+        if (!p.uuid) return Promise.resolve();
+        setReloading(true);
+        return api<Details>('GET', `${base()}/players/${p.uuid}${fresh ? '?fresh=1' : ''}`)
             .then(setDetails)
-            .catch((e) => toastErr(e.message));
+            .catch((e) => toastErr(e.message))
+            .finally(() => setReloading(false));
+    };
+
+    useEffect(() => {
+        loadDetails(p.online && props.overview.can_console);
     }, [p.uuid]);
 
     const run = async (action: string, extra: Record<string, any> = {}, success?: string) => {
         setBusy(action);
         try {
-            await api('POST', base() + '/action', { action, name: p.name, ...extra });
-            toastOk(success ?? `Sent: ${action.replace('_', ' ')} ${p.name}`);
+            const r: any = await api('POST', base() + '/action', { action, name: p.name, ...extra });
+            toastOk(r?.offline ? r.message : success ?? `Sent: ${action.replace('_', ' ')} ${p.name}`);
             props.onChanged();
         } catch (e: any) {
             toastErr(e.message);
@@ -148,6 +115,13 @@ function PlayerModal(props: { player: Player; overview: Overview; online: string
     const s = details?.summary;
     const can = (k: string) => props.overview.allow?.[k] !== false;
     const canAct = props.overview.can_console && !!p.name;
+    // Live edits need the console (and a name for the commands); offline edits change the player file.
+    const editable = can('allow_inventory_edit') && (p.online ? props.overview.can_console && !!p.name : props.overview.can_update !== false);
+    const editHint = !can('allow_inventory_edit')
+        ? 'Inventory editing is disabled by the administrator.'
+        : p.online
+          ? 'Editing an online player needs the console permission.'
+          : 'Editing an offline player needs the file update permission.';
 
     return (
         <Modal open onClose={props.onClose} width={760}>
@@ -164,6 +138,11 @@ function PlayerModal(props: { player: Player; overview: Overview; online: string
                         {s?.gamemode ? <Badge>{s.gamemode}</Badge> : null}
                     </div>
                 </div>
+                {p.uuid ? (
+                    <Button size='sm' variant='ghost' loading={reloading} onClick={() => loadDetails(p.online && props.overview.can_console)} title='Reload the saved player data'>
+                        Reload
+                    </Button>
+                ) : null}
             </div>
             <Tabs
                 value={tab}
@@ -171,7 +150,6 @@ function PlayerModal(props: { player: Player; overview: Overview; online: string
                 tabs={[
                     { key: 'overview', label: 'Overview' },
                     { key: 'inventory', label: 'Inventory' },
-                    { key: 'ender', label: 'Ender chest' },
                     { key: 'stats', label: 'Statistics' },
                     { key: 'actions', label: 'Actions' },
                 ]}
@@ -220,23 +198,20 @@ function PlayerModal(props: { player: Player; overview: Overview; online: string
                 </div>
             ) : null}
 
-            {(tab === 'inventory' || tab === 'ender') && details?.inventory_hidden ? <Alert kind='info'>Inventory viewing is disabled by the administrator.</Alert> : null}
-            {tab === 'inventory' && details && !details.error && !details.inventory_hidden ? (
-                <div className='brf-row' style={{ alignItems: 'flex-start', gap: 18 }}>
-                    <div className='brf-col' style={{ gap: 4 }}>
-                        {(['head', 'chest', 'legs', 'feet', 'offhand'] as const).map((slot) => (
-                            <ItemTile key={slot} item={details.equipment[slot]} label={slot} />
-                        ))}
-                    </div>
-                    <div className='brf-col' style={{ gap: 10 }}>
-                        <Grid items={details.inventory} from={9} count={27} />
-                        <Grid items={details.inventory} from={0} count={9} />
-                        <span className='brf-muted'>Hover an item for details. Saved data refreshes when the player logs out or the world autosaves.</span>
-                    </div>
-                </div>
+            {tab === 'inventory' && details?.inventory_hidden ? <Alert kind='info'>Inventory viewing is disabled by the administrator.</Alert> : null}
+            {tab === 'inventory' && details && !details.error && !details.inventory_hidden && p.uuid ? (
+                <InventoryManager
+                    uuid={p.uuid}
+                    name={p.name}
+                    online={p.online}
+                    inventory={details.inventory}
+                    ender={details.ender_chest}
+                    equipment={details.equipment}
+                    canEdit={editable}
+                    editHint={editHint}
+                    onChanged={() => loadDetails(p.online && props.overview.can_console)}
+                />
             ) : null}
-
-            {tab === 'ender' && details && !details.error && !details.inventory_hidden ? <Grid items={details.ender_chest} from={0} count={27} /> : null}
 
             {tab === 'stats' && details ? (
                 details.stats ? (
@@ -289,6 +264,15 @@ function PlayerModal(props: { player: Player; overview: Overview; online: string
                     <Alert kind='warn'>You need console permission (and a known player name) to run actions.</Alert>
                 ) : (
                     <div className='brf-col'>
+                        {!props.overview.status.reachable ? (
+                            <Alert kind='info' style={{ marginBottom: 0 }}>
+                                The server looks stopped. Whitelist, operator and ban changes are written to the server files and apply on the next start; the other actions need the server running.
+                            </Alert>
+                        ) : !p.online ? (
+                            <Alert kind='info' style={{ marginBottom: 0 }}>
+                                {p.name} is offline. Whitelist, operator and ban actions work; in-game actions (teleport, items, effects, messages) need the player online.
+                            </Alert>
+                        ) : null}
                         <div className='brf-row'>
                             {can('allow_whitelist') ? <Button size='sm' variant='sec' loading={busy === (p.whitelisted ? 'whitelist_remove' : 'whitelist_add')} onClick={() => run(p.whitelisted ? 'whitelist_remove' : 'whitelist_add')}>
                                 {p.whitelisted ? 'Remove from whitelist' : 'Add to whitelist'}
@@ -458,8 +442,8 @@ function ServerTools(props: { overview: Overview; onChanged: () => void }) {
     const send = async (key: string, action: string, extra: Record<string, any>, ok: string) => {
         setBusy(key);
         try {
-            await api('POST', base() + '/action', { action, ...extra });
-            toastOk(ok);
+            const r: any = await api('POST', base() + '/action', { action, ...extra });
+            toastOk(r?.offline ? r.message : ok);
             props.onChanged();
         } catch (e: any) {
             toastErr(e.message);
@@ -570,6 +554,7 @@ const PROPERTY_LABELS: Record<string, string> = {
     'spawn-protection': 'Spawn protection radius',
     'view-distance': 'View distance (chunks)',
     'simulation-distance': 'Simulation distance (chunks)',
+    'online-mode': 'Online mode (check Mojang accounts; off = offline/cracked mode)',
 };
 
 function PropertiesEditor() {
@@ -684,8 +669,8 @@ export default function PlayersPage() {
 
     const command = async (action: string, extra: Record<string, any>, ok: string) => {
         try {
-            await api('POST', base() + '/action', { action, ...extra });
-            toastOk(ok);
+            const r: any = await api('POST', base() + '/action', { action, ...extra });
+            toastOk(r?.offline ? r.message : ok);
             refreshSoon();
         } catch (e: any) {
             toastErr(e.message);
@@ -770,6 +755,30 @@ export default function PlayersPage() {
                             <span>
                                 {overview.properties.gamemode ?? ''} · {overview.properties.difficulty ?? ''} · {overview.properties.online_mode ? 'online mode' : 'offline mode'}
                             </span>
+                            {overview.can_update && overview.allow?.allow_properties !== false ? (
+                                <span>
+                                    <ConfirmButton
+                                        size='sm'
+                                        variant='ghost'
+                                        title={overview.properties.online_mode ? 'Turn offline mode on?' : 'Turn online mode back on?'}
+                                        message={overview.properties.online_mode
+                                            ? 'Players will no longer be checked against Mojang accounts (cracked clients can join). Player UUIDs change, so existing players start with new inventories, op and whitelist entries. Restart the server to apply.'
+                                            : 'Only real Minecraft accounts can join again. Offline-mode player data is kept but belongs to different UUIDs. Restart the server to apply.'}
+                                        confirmText={overview.properties.online_mode ? 'Turn offline mode on' : 'Turn online mode on'}
+                                        onConfirm={async () => {
+                                            try {
+                                                await api('POST', base() + '/properties', { properties: { 'online-mode': overview.properties.online_mode ? 'false' : 'true' } });
+                                                toastOk(`Online mode ${overview.properties.online_mode ? 'off' : 'on'}. Restart the server to apply.`);
+                                                load();
+                                            } catch (e: any) {
+                                                toastErr(e.message);
+                                            }
+                                        }}
+                                    >
+                                        {overview.properties.online_mode ? 'Offline mode: turn on' : 'Online mode: turn on'}
+                                    </ConfirmButton>
+                                </span>
+                            ) : null}
                         </div>
                     </div>
                     {st.motd ? <Alert kind='info'>{st.motd}</Alert> : null}

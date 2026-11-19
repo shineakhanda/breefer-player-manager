@@ -34,6 +34,8 @@ final class AdminFields
             $t('allow_properties', 'Edit server.properties', '1', 'Requires the file.update permission as well.'),
             $t('allow_wipe', 'Wipe player data (deletes files)', '1', 'Requires the file.delete permission as well.'),
             ['key' => 'allow_inventory', 'label' => 'Show inventories and ender chests', 'type' => 'toggle', 'default' => '1', 'section' => 'Privacy'],
+            ['key' => 'allow_inventory_edit', 'label' => 'Allow editing inventories and ender chests (add, remove, move items)', 'type' => 'toggle', 'default' => '1', 'section' => 'Privacy',
+                'help' => 'Online players are changed live with /item commands (console permission); offline players by editing their player file (file.update permission).'],
             ['key' => 'admins_bypass', 'label' => 'Root admins can always use every action', 'type' => 'toggle', 'default' => '1', 'section' => 'Privacy'],
             ...RouteScope::fields(),
         ];

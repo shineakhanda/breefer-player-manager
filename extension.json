@@ -1,8 +1,8 @@
 {
     "id": "breefer-player-manager",
     "name": "Breefer Player Manager",
-    "version": "1.2.0",
-    "description": "Minecraft player dashboard: online players, inventories, stats, moderation, teleport, titles, server tools (weather, time, game rules, broadcast) and a server.properties editor.",
+    "version": "1.3.0",
+    "description": "Minecraft player dashboard: inventory and ender chest editor with an item catalog (live for online players), stats, moderation, teleport, server tools and a server.properties editor.",
     "author": "Shine Akhanda",
     "website": null,
     "update_url": null,
@@ -46,6 +46,7 @@
         "source": {
             "entry": "frontend/src/PlayersPage.tsx",
             "entries": [
+                "frontend/src/InventoryManager.tsx",
                 "frontend/src/breefer-ui.tsx"
             ]
         }

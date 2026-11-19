@@ -1,10 +1,10 @@
 # Breefer Player Manager
 
-A player dashboard for Minecraft: live status (ping), online players, operators, whitelist, bans and banned IPs; per-player health, food, XP, position, effects, inventory / armor / ender chest (read from playerdata NBT) and statistics; actions like whitelist, op, gamemode, teleport (to coordinates or another player), give item, set/add XP, effects, heal/feed, on-screen titles, message, kick, ban, IP-ban and wipe player data. A **Server tools** tab adds broadcast, weather, time, difficulty, game rules, save-all and kick-all, and **Server settings** edits `server.properties` (MOTD, max players, difficulty, whitelist, query, view distance and more).
+A player dashboard for Minecraft: live status (ping), online players, operators, whitelist, bans and banned IPs; per-player health, food, XP, position, effects and statistics; a **Minecraft-style inventory editor** for inventory, armor, offhand and ender chest (add any item from the full item list, remove, change the amount, move or swap items by click or drag and drop, live for online players and through the player file for offline players, no restart); actions like whitelist, op, gamemode, teleport (to coordinates or another player), give item, set/add XP, effects, heal/feed, on-screen titles, message, kick, ban, IP-ban and wipe player data. A **Server tools** tab adds broadcast, weather, time, difficulty, game rules, save-all and kick-all, and **Server settings** edits `server.properties` (MOTD, max players, difficulty, whitelist, query, view distance and more).
 
 ## Download
 
-The ready-to-install package is [`release/breefer-player-manager-v1.2.0.rext`](release/breefer-player-manager-v1.2.0.rext). Upload it under **Admin → Extensions** in Reviactyl.
+The ready-to-install package is [`release/breefer-player-manager-v1.3.0.rext`](release/breefer-player-manager-v1.3.0.rext) (also attached to the GitHub release). Upload it under **Admin → Extensions** in Reviactyl.
 
 ## Repository layout
 
@@ -44,17 +44,21 @@ Older builds use the singular form shown in the example extension: `php artisan 
 
 Admin area → sidebar group **Breefer** → **Player Manager** (root admins only). Fallback URL: `/admin/extensions/breefer-player-manager`.
 
-Options: Per-action switches (whitelist, op, kick/ban, gamemode, give items/XP, effects, kill/clear inventory, messages/titles, teleport, server tools, server.properties editing, wipe data), hide inventories, admin bypass, page visibility.
+Options: Per-action switches (whitelist, op, kick/ban, gamemode, give items/XP, effects, kill/clear inventory, messages/titles, teleport, server tools, server.properties editing, wipe data), hide inventories, allow inventory editing, admin bypass, page visibility.
 
 ## Data and external services
 
 - Data: No database tables; everything is read from the server files.
-- External services: Player avatars from `mc-heads.net`, item textures from `assets.mcasset.cloud` (browser side).
+- External services: 3D player heads from `mc-heads.net`, 3D inventory icons from `minecraft.wiki` with flat textures from `assets.mcasset.cloud` as fallback (browser side); the item list comes from PrismarineJS minecraft-data via `cdn.jsdelivr.net` (panel side, cached).
 
 ## Notes
 
+- Works with every world layout: `world/players/data` (Minecraft 26.x) and `world/playerdata` (1.21 and older). Game rule names are sent in the right style for the server version.
 - Set `enable-query=true` in server.properties to list every online player (the status ping only returns a sample of 12).
-- Actions are console commands, so the server must be running.
+- While the server is stopped, whitelist, operator, ban and IP-ban changes are written to `whitelist.json`, `ops.json`, `banned-players.json` and `banned-ips.json` and apply on the next start. In-game actions (teleport, items, effects, messages) need the server running and the player online.
+- Opening an online player asks the server to save first, so inventory and position are current.
+- Inventory editing: online players are changed with `/item replace` and `/item modify` commands; offline players by rewriting their `.dat` (a `.breefer-backup` copy of the previous file is kept next to it). Swapping two items needs one free inventory or ender chest slot while the player is online.
+- Online mode can be switched on or off from the World card or the Server settings tab (restart required). Offline-mode players get different UUIDs, so their data does not carry over.
 
 ## Development
 

@@ -5,13 +5,16 @@ namespace Breefer\PlayerManager\Http;
 use App\Models\Permission;
 use App\Models\Server;
 use App\Repositories\Agent\DaemonFileRepository;
+use Breefer\PlayerManager\Minecraft\InventoryEditor;
 use Breefer\PlayerManager\Minecraft\Nbt;
+use Breefer\PlayerManager\Minecraft\NbtTree;
 use Breefer\PlayerManager\Minecraft\ServerQuery;
 use Breefer\PlayerManager\Support\BaseController;
 use Breefer\PlayerManager\Support\Plugin;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
 
 class PlayerController extends BaseController
 {
@@ -33,6 +36,9 @@ class PlayerController extends BaseController
         'gamerule' => 'allow_world', 'save_all' => 'allow_world', 'kick_all' => 'allow_moderation',
     ];
 
+    /** Actions that can be applied by editing files while the server is stopped. */
+    private const OFFLINE_ACTIONS = ['whitelist_add', 'whitelist_remove', 'whitelist_on', 'whitelist_off', 'op', 'deop', 'ban', 'pardon', 'ban_ip', 'pardon_ip'];
+
     /** Actions that do not target a player. */
     private const SERVER_ACTIONS = ['whitelist_on', 'whitelist_off', 'ban_ip', 'pardon_ip', 'broadcast', 'weather', 'time', 'difficulty', 'gamerule', 'save_all', 'kick_all'];
 
@@ -49,7 +55,7 @@ class PlayerController extends BaseController
         'motd' => 'string', 'max-players' => 'int:1:10000', 'difficulty' => 'enum:peaceful,easy,normal,hard',
         'gamemode' => 'enum:survival,creative,adventure,spectator', 'pvp' => 'bool', 'hardcore' => 'bool', 'white-list' => 'bool',
         'enforce-whitelist' => 'bool', 'enable-query' => 'bool', 'allow-flight' => 'bool', 'allow-nether' => 'bool',
-        'spawn-monsters' => 'bool', 'spawn-protection' => 'int:0:1000', 'view-distance' => 'int:2:32', 'simulation-distance' => 'int:2:32',
+        'spawn-monsters' => 'bool', 'online-mode' => 'bool', 'spawn-protection' => 'int:0:1000', 'view-distance' => 'int:2:32', 'simulation-distance' => 'int:2:32',
     ];
 
     private function allowed(Request $request, string $setting): bool
@@ -71,6 +77,7 @@ class PlayerController extends BaseController
         $out['allow_wipe'] = $this->allowed($request, 'allow_wipe');
         $out['allow_inventory'] = $this->allowed($request, 'allow_inventory');
         $out['allow_properties'] = $this->allowed($request, 'allow_properties');
+        $out['allow_inventory_edit'] = $this->allowed($request, 'allow_inventory_edit');
 
         return $out;
     }
@@ -113,6 +120,20 @@ class PlayerController extends BaseController
         return trim(str_replace(['..', '\\'], '', $level), '/') ?: 'world';
     }
 
+    /**
+     * Folders holding per-player files. Minecraft 26.1+ keeps them in <world>/players/{data,stats,advancements};
+     * older versions use <world>/playerdata, <world>/stats and <world>/advancements. Newest layout first.
+     *
+     * @return array<int, array{data: string, stats: string, advancements: string}>
+     */
+    private function playerDirs(string $world): array
+    {
+        return [
+            ['data' => "{$world}/players/data", 'stats' => "{$world}/players/stats", 'advancements' => "{$world}/players/advancements"],
+            ['data' => "{$world}/playerdata", 'stats' => "{$world}/stats", 'advancements' => "{$world}/advancements"],
+        ];
+    }
+
     /** @return array{0: string, 1: int} */
     private function address(Server $server): array
     {
@@ -123,6 +144,70 @@ class PlayerController extends BaseController
         }
 
         return [$ip, (int) ($server->allocation->port ?? 25565)];
+    }
+
+    /**
+     * Hosts to try for the status ping: the allocation IP is not always reachable from the panel
+     * (NAT, private addresses), so fall back to the IP alias and the node's FQDN.
+     *
+     * @return array<int, string>
+     */
+    private function pingHosts(Server $server): array
+    {
+        $server->loadMissing('allocation', 'node');
+        $remembered = Cache::get('breefer:pm:host:'.$server->id);
+        $hosts = [$remembered, $server->allocation->ip ?? null, $server->allocation->ip_alias ?? null, $server->node->fqdn ?? null];
+        $hosts = array_filter($hosts, fn ($h) => is_string($h) && $h !== '' && ! in_array($h, ['0.0.0.0', '::'], true));
+
+        return array_values(array_unique($hosts));
+    }
+
+    /** Resolve names for UUIDs that only have player files (online-mode UUIDs via Mojang, cached). */
+    private function resolveName(string $uuid): ?string
+    {
+        $uuid = $this->dashed($uuid);
+        if (($uuid[14] ?? '') !== '4') {
+            return null; // offline-mode (v3) UUIDs have no Mojang profile
+        }
+
+        return Cache::remember('breefer:pm:name:'.$uuid, 7 * 86400, function () use ($uuid) {
+            try {
+                $response = Http::timeout(3)->acceptJson()->withUserAgent(Plugin::userAgent())
+                    ->get('https://api.minecraftservices.com/minecraft/profile/lookup/'.str_replace('-', '', $uuid));
+
+                return $response->ok() && is_string($response->json('name')) ? $response->json('name') : null;
+            } catch (\Throwable) {
+                return null;
+            }
+        });
+    }
+
+    /** UUID for a player name: usercache first, then Mojang (online mode) or the offline-mode UUID. */
+    private function uuidFor(DaemonFileRepository $files, string $name, bool $onlineMode): ?string
+    {
+        foreach ($this->json($files, 'usercache.json') as $entry) {
+            if (strcasecmp((string) ($entry['name'] ?? ''), $name) === 0 && ! empty($entry['uuid'])) {
+                return $this->dashed((string) $entry['uuid']);
+            }
+        }
+        if ($onlineMode) {
+            try {
+                $response = Http::timeout(4)->acceptJson()->withUserAgent(Plugin::userAgent())
+                    ->get('https://api.minecraftservices.com/minecraft/profile/lookup/name/'.rawurlencode($name));
+                if ($response->ok() && is_string($response->json('id'))) {
+                    return $this->dashed($response->json('id'));
+                }
+            } catch (\Throwable) {
+                // fall through
+            }
+
+            return null;
+        }
+        $hash = md5('OfflinePlayer:'.$name);
+        $hash[12] = '3';
+        $hash[16] = dechex((hexdec($hash[16]) & 0x3) | 0x8);
+
+        return $this->dashed($hash);
     }
 
     private function dashed(string $uuid): string
@@ -144,12 +229,22 @@ class PlayerController extends BaseController
     private function status(Server $server, array $props): array
     {
         return Cache::remember('breefer:pm:status:'.$server->id, 10, function () use ($server, $props) {
-            [$host, $port] = $this->address($server);
-            try {
-                $status = ServerQuery::ping($host, $port);
-                $status['reachable'] = true;
-            } catch (\Throwable $exception) {
-                return ['reachable' => false, 'error' => $exception->getMessage(), 'online' => 0, 'max' => 0, 'sample' => []];
+            [, $port] = $this->address($server);
+            $status = null;
+            $error = 'Server is not reachable.';
+            foreach ($this->pingHosts($server) as $candidate) {
+                try {
+                    $status = ServerQuery::ping($candidate, $port, 2.0);
+                    $status['reachable'] = true;
+                    $host = $candidate;
+                    Cache::put('breefer:pm:host:'.$server->id, $candidate, 600);
+                    break;
+                } catch (\Throwable $exception) {
+                    $error = $exception->getMessage();
+                }
+            }
+            if ($status === null) {
+                return ['reachable' => false, 'error' => $error, 'online' => 0, 'max' => 0, 'sample' => []];
             }
 
             if (($props['enable-query'] ?? 'false') === 'true') {
@@ -191,6 +286,7 @@ class PlayerController extends BaseController
             'world' => $this->world($props),
             'can_console' => $request->user()->can(Permission::ACTION_CONTROL_CONSOLE, $server),
             'can_delete' => $request->user()->can(Permission::ACTION_FILE_DELETE, $server) && $this->allowed($request, 'allow_wipe'),
+            'can_update' => $request->user()->can(Permission::ACTION_FILE_UPDATE, $server),
             'allow' => $this->permissions($request),
         ]);
     }
@@ -248,34 +344,46 @@ class PlayerController extends BaseController
             $players[$k]['online'] = true;
         }
 
-        try {
-            $dat = $files->getDirectory($world.'/playerdata');
-            $withData = [];
-            foreach ($dat as $file) {
-                if (preg_match('/^([0-9a-f\-]{36})\.dat$/i', $file['name'], $m)) {
-                    $withData[strtolower($m[1])] = $file['modified'] ?? null;
+        $withData = [];
+        foreach (array_reverse($this->playerDirs($world)) as $dirs) { // newest layout last, so it wins
+            try {
+                foreach ($files->getDirectory($dirs['data']) as $file) {
+                    if (preg_match('/^([0-9a-f\-]{36})\.dat$/i', $file['name'], $m)) {
+                        $withData[strtolower($m[1])] = $file['modified'] ?? null;
+                    }
                 }
+            } catch (\Throwable) {
+                // folder does not exist for this layout / world not generated yet
             }
-            foreach ($players as $k => $p) {
-                if ($p['uuid'] && isset($withData[$p['uuid']])) {
-                    $players[$k]['has_data'] = true;
-                    $players[$k]['last_seen'] ??= $withData[$p['uuid']];
-                    unset($withData[$p['uuid']]);
-                }
-            }
-            foreach ($withData as $uuid => $modified) {
-                $k = $add($uuid, null);
+        }
+        foreach ($players as $k => $p) {
+            if ($p['uuid'] && array_key_exists($p['uuid'], $withData)) {
                 $players[$k]['has_data'] = true;
-                $players[$k]['last_seen'] = $modified;
+                if ($withData[$p['uuid']] && (! $p['last_seen'] || strtotime((string) $withData[$p['uuid']]) > strtotime((string) $p['last_seen']))) {
+                    $players[$k]['last_seen'] = $withData[$p['uuid']];
+                }
+                unset($withData[$p['uuid']]);
             }
-        } catch (\Throwable) {
-            // world not generated yet
+        }
+        foreach ($withData as $uuid => $modified) {
+            $k = $add($uuid, null);
+            $players[$k]['has_data'] = true;
+            $players[$k]['last_seen'] = $modified;
+        }
+
+        // Give a name to players known only by their data file (needed for actions).
+        $lookups = 0;
+        foreach ($players as $k => $p) {
+            if (! $p['name'] && $p['uuid'] && $lookups < 10) {
+                $lookups++;
+                $players[$k]['name'] = $this->resolveName($p['uuid']);
+            }
         }
 
         $bannedIps = array_map(fn ($e) => ['ip' => $e['ip'] ?? '', 'reason' => $e['reason'] ?? null, 'source' => $e['source'] ?? null, 'expires' => $e['expires'] ?? 'forever'], $this->json($files, 'banned-ips.json'));
 
         $list = array_values($players);
-        usort($list, fn ($a, $b) => [$b['online'], $b['last_seen'] ?? ''] <=> [$a['online'], $a['last_seen'] ?? '']);
+        usort($list, fn ($a, $b) => [$b['online'], strtotime((string) ($b['last_seen'] ?? '')) ?: 0] <=> [$a['online'], strtotime((string) ($a['last_seen'] ?? '')) ?: 0]);
 
         return new JsonResponse(['players' => $list, 'banned_ips' => $bannedIps, 'full_list' => (bool) ($status['full_list'] ?? false)]);
     }
@@ -290,16 +398,34 @@ class PlayerController extends BaseController
         $files = $this->files($server);
         $world = $this->world($this->properties($files));
 
-        $data = null;
-        $error = null;
-        try {
-            $raw = $files->getContent($world.'/playerdata/'.$uuid.'.dat', 16 * 1024 * 1024);
-            $data = Nbt::parse($raw);
-        } catch (\Throwable $exception) {
-            $error = str_contains($exception->getMessage(), 'NBT') ? $exception->getMessage() : 'No saved data yet (the player has not joined this world).';
+        // For online players, ask the server to write its player data first so the view is current.
+        if ($request->boolean('fresh') && $request->user()->can(Permission::ACTION_CONTROL_CONSOLE, $server)) {
+            try {
+                $this->commands($server)->send(['save-all']);
+                usleep(1_500_000);
+            } catch (\Throwable) {
+                // server offline: the files on disk are already current
+            }
         }
 
-        $stats = $this->json($files, $world.'/stats/'.$uuid.'.json');
+        $data = null;
+        $error = 'No saved data yet. Player data is written when the player leaves or the world saves.';
+        $stats = [];
+        foreach ($this->playerDirs($world) as $dirs) {
+            if ($data === null) {
+                try {
+                    $data = Nbt::parse($files->getContent($dirs['data'].'/'.$uuid.'.dat', 16 * 1024 * 1024));
+                    $error = null;
+                } catch (\Throwable $exception) {
+                    if (str_contains($exception->getMessage(), 'NBT')) {
+                        $error = $exception->getMessage();
+                    }
+                }
+            }
+            if (! $stats) {
+                $stats = $this->json($files, $dirs['stats'].'/'.$uuid.'.json');
+            }
+        }
         $showInv = $this->allowed($request, 'allow_inventory');
 
         return new JsonResponse([
@@ -408,13 +534,79 @@ class PlayerController extends BaseController
         try {
             $this->commands($server)->send($commands);
         } catch (\Throwable) {
-            return $this->fail('The command could not be sent. Is the server running?', 409);
+            // Server stopped: list changes can still be made by editing the files the server reads on start.
+            if (in_array($data['action'], self::OFFLINE_ACTIONS, true)) {
+                return $this->offlineEdit($request, $server, $data['action'], $name, $data['ip'] ?? null, $reason);
+            }
+
+            return $this->fail('The command could not be sent because the server is not running. Start the server and try again.', 409);
         }
 
         Cache::forget('breefer:pm:status:'.$server->id);
         $this->activity('server:breefer.players.'.$data['action'], ['player' => $name, 'ip' => $data['ip'] ?? null, 'reason' => $reason ?: null]);
 
         return $this->ok(['commands' => $commands]);
+    }
+
+    /** Applies whitelist/op/ban changes straight to the JSON files while the server is stopped. */
+    private function offlineEdit(Request $request, Server $server, string $action, ?string $name, ?string $ip, string $reason): JsonResponse
+    {
+        $files = $this->files($server);
+        $props = $this->properties($files);
+        $source = 'Panel ('.($request->user()->username ?? 'user').')';
+        $now = gmdate('Y-m-d H:i:s').' +0000';
+
+        if (in_array($action, ['whitelist_on', 'whitelist_off'], true)) {
+            $value = $action === 'whitelist_on' ? 'true' : 'false';
+            try {
+                $raw = $files->getContent('server.properties', 256 * 1024);
+            } catch (\Throwable) {
+                $raw = '';
+            }
+            $raw = preg_match('/^white-list=.*$/m', $raw) ? (string) preg_replace('/^white-list=.*$/m', 'white-list='.$value, $raw) : rtrim($raw)."\nwhite-list={$value}\n";
+            $files->putContent('server.properties', $raw);
+            $this->activity('server:breefer.players.'.$action, ['offline' => true]);
+
+            return $this->ok(['offline' => true, 'message' => 'The server is stopped, so server.properties was updated. The change applies on the next start.']);
+        }
+
+        if (in_array($action, ['ban_ip', 'pardon_ip'], true)) {
+            if (! $ip) {
+                return $this->fail('Enter the IP address: a player\'s IP is only known while they are online.', 422);
+            }
+            $list = $this->json($files, 'banned-ips.json');
+            $list = array_values(array_filter($list, fn ($e) => ($e['ip'] ?? null) !== $ip));
+            if ($action === 'ban_ip') {
+                $list[] = ['ip' => $ip, 'created' => $now, 'source' => $source, 'expires' => 'forever', 'reason' => $reason ?: 'Banned by an operator.'];
+            }
+            $files->putContent('banned-ips.json', json_encode($list, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)."\n");
+            $this->activity('server:breefer.players.'.$action, ['ip' => $ip, 'offline' => true]);
+
+            return $this->ok(['offline' => true, 'message' => 'The server is stopped, so banned-ips.json was updated. The change applies on the next start.']);
+        }
+
+        $uuid = $this->uuidFor($files, (string) $name, ($props['online-mode'] ?? 'true') === 'true');
+        if ($uuid === null) {
+            return $this->fail("Could not find the Minecraft account \"{$name}\". Check the spelling, or start the server and try again.", 422);
+        }
+
+        [$file, $remove] = match ($action) {
+            'whitelist_add', 'whitelist_remove' => ['whitelist.json', $action === 'whitelist_remove'],
+            'op', 'deop' => ['ops.json', $action === 'deop'],
+            'ban', 'pardon' => ['banned-players.json', $action === 'pardon'],
+        };
+        $list = array_values(array_filter($this->json($files, $file), fn ($e) => strtolower((string) ($e['uuid'] ?? '')) !== $uuid && strcasecmp((string) ($e['name'] ?? ''), (string) $name) !== 0));
+        if (! $remove) {
+            $list[] = match ($action) {
+                'whitelist_add' => ['uuid' => $uuid, 'name' => $name],
+                'op' => ['uuid' => $uuid, 'name' => $name, 'level' => 4, 'bypassesPlayerLimit' => false],
+                'ban' => ['uuid' => $uuid, 'name' => $name, 'created' => $now, 'source' => $source, 'expires' => 'forever', 'reason' => $reason ?: 'Banned by an operator.'],
+            };
+        }
+        $files->putContent($file, json_encode($list, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)."\n");
+        $this->activity('server:breefer.players.'.$action, ['player' => $name, 'uuid' => $uuid, 'offline' => true]);
+
+        return $this->ok(['offline' => true, 'message' => "The server is stopped, so {$file} was updated. The change applies on the next start."]);
     }
 
     private function coord(mixed $v): string
@@ -529,6 +721,227 @@ class PlayerController extends BaseController
         return $this->ok(['changes' => $changes]);
     }
 
+    /* ------------------------------------------------- inventory editing */
+
+    /** Where the player's .dat lives (newest layout first). Null when the player has no file yet. */
+    private function playerFile(DaemonFileRepository $files, string $world, string $uuid): ?string
+    {
+        foreach ($this->playerDirs($world) as $dirs) {
+            try {
+                foreach ($files->getDirectory($dirs['data']) as $file) {
+                    if (strcasecmp($file['name'], $uuid.'.dat') === 0) {
+                        return $dirs['data'].'/'.$file['name'];
+                    }
+                }
+            } catch (\Throwable) {
+                // layout not used by this server
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Is the player online? true / false, or null when the status ping only returned a partial
+     * player sample (large servers without enable-query).
+     */
+    private function isOnline(array $status, string $name): ?bool
+    {
+        if (! ($status['reachable'] ?? false)) {
+            return false;
+        }
+        foreach ($status['sample'] ?? [] as $entry) {
+            if (strcasecmp((string) ($entry['name'] ?? ''), $name) === 0) {
+                return true;
+            }
+        }
+        $complete = ($status['full_list'] ?? false) || count($status['sample'] ?? []) >= (int) ($status['online'] ?? 0);
+
+        return $complete ? false : null;
+    }
+
+    /** @return array<string, mixed> normalised operation */
+    private function inventoryOp(Request $request): array
+    {
+        $data = $request->validate([
+            'op' => 'required|in:set,remove,move,count',
+            'container' => 'nullable|in:inventory,ender,equipment',
+            'slot' => 'nullable|string|max:16',
+            'id' => ['nullable', 'string', 'max:100', 'regex:'.InventoryEditor::ITEM_ID],
+            'count' => 'nullable|integer|min:1|max:99',
+            'from' => 'nullable|array',
+            'from.container' => 'nullable|in:inventory,ender,equipment',
+            'from.slot' => 'nullable|string|max:16',
+            'to' => 'nullable|array',
+            'to.container' => 'nullable|in:inventory,ender,equipment',
+            'to.slot' => 'nullable|string|max:16',
+        ]);
+        $op = ['op' => $data['op']];
+        if ($data['op'] === 'move') {
+            $op['from'] = InventoryEditor::slot((string) ($data['from']['container'] ?? ''), $data['from']['slot'] ?? null);
+            $op['to'] = InventoryEditor::slot((string) ($data['to']['container'] ?? ''), $data['to']['slot'] ?? null);
+
+            return $op;
+        }
+        $op['slot'] = InventoryEditor::slot((string) ($data['container'] ?? ''), $data['slot'] ?? null);
+        if ($data['op'] === 'set') {
+            if (empty($data['id'])) {
+                throw new \InvalidArgumentException('Choose an item.');
+            }
+            $op['id'] = $data['id'];
+            $op['count'] = (int) ($data['count'] ?? 1);
+        }
+        if ($data['op'] === 'count') {
+            $op['count'] = (int) ($data['count'] ?? 1);
+            $op['id'] = $data['id'] ?? null;
+        }
+
+        return $op;
+    }
+
+    public function inventory(Request $request, Server $server, string $uuid): JsonResponse
+    {
+        $this->authorizeServer($request, $server, Permission::ACTION_FILE_READ_CONTENT);
+        if (! $this->allowed($request, 'allow_inventory_edit') || ! $this->allowed($request, 'allow_inventory')) {
+            return $this->fail('Inventory editing is disabled by the administrator.', 403);
+        }
+        if (! preg_match(self::UUID, $uuid)) {
+            return $this->fail('Invalid player UUID.', 422);
+        }
+        $uuid = $this->dashed($uuid);
+        try {
+            $op = $this->inventoryOp($request);
+        } catch (\InvalidArgumentException $exception) {
+            return $this->fail($exception->getMessage(), 422);
+        }
+
+        $files = $this->files($server);
+        $props = $this->properties($files);
+        $world = $this->world($props);
+        $name = (string) $request->input('name', '');
+        Cache::forget('breefer:pm:status:'.$server->id);
+        $status = $this->status($server, $props);
+        $online = $name !== '' && preg_match(self::NAME, $name) ? $this->isOnline($status, $name) : false;
+
+        if ($online === null) {
+            return $this->fail('Could not tell whether the player is online (the server only lists some players). Set enable-query=true in server.properties.', 409);
+        }
+
+        if ($online) {
+            // Live: /item commands, applied immediately.
+            if (! $request->user()->can(Permission::ACTION_CONTROL_CONSOLE, $server)) {
+                return $this->fail('Editing an online player\'s inventory needs the console permission.', 403);
+            }
+            try {
+                $this->commands($server)->send(['save-all']); // write current data so slot checks are accurate
+            } catch (\Throwable) {
+                return $this->fail('The server stopped responding. Try again in a moment.', 409);
+            }
+            usleep(1_200_000);
+            $occupied = function (array $slot): bool {
+                return false;
+            };
+            $path = $this->playerFile($files, $world, $uuid);
+            $dataVersion = 0;
+            if ($path !== null) {
+                try {
+                    $editor = new InventoryEditor(NbtTree::decode($files->getContent($path, 16 * 1024 * 1024))['tag']);
+                    $occupied = fn (array $slot): bool => $editor->get($slot) !== null;
+                    $dataVersion = (int) ($editor->root()['v']['DataVersion']['v'] ?? 0);
+                } catch (\Throwable) {
+                    // fall back to "empty" knowledge
+                }
+            }
+            try {
+                $commands = InventoryEditor::commands($name, $op, $occupied, $dataVersion === 0 || $dataVersion >= 3837);
+            } catch (\RuntimeException $exception) {
+                return $this->fail($exception->getMessage(), 409);
+            }
+            if ($commands) {
+                try {
+                    $this->commands($server)->send([...$commands, 'save-all']);
+                } catch (\Throwable) {
+                    return $this->fail('The commands could not be sent. Is the server still running?', 409);
+                }
+                usleep(1_200_000);
+            }
+            $this->activity('server:breefer.players.inventory', ['player' => $name, 'op' => $op['op'], 'live' => true]);
+
+            return $this->ok(['live' => true, 'commands' => $commands, 'message' => 'Applied in game.']);
+        }
+
+        // Offline: edit the player file; the server loads it on the next join, no restart needed.
+        if (! $request->user()->can(Permission::ACTION_FILE_UPDATE, $server)) {
+            return $this->fail('Editing an offline player\'s inventory needs the file.update permission.', 403);
+        }
+        $path = $this->playerFile($files, $world, $uuid);
+        if ($path === null) {
+            return $this->fail('This player has no saved data yet. They need to join the server once.', 404);
+        }
+        try {
+            $raw = $files->getContent($path, 16 * 1024 * 1024);
+            $doc = NbtTree::decode($raw);
+            $editor = new InventoryEditor($doc['tag']);
+            $editor->apply($op);
+            $files->putContent($path.'.breefer-backup', $raw);
+            $files->putContent($path, NbtTree::encode($editor->root(), $doc['name'], $doc['gzip']));
+        } catch (\RuntimeException|\InvalidArgumentException $exception) {
+            return $this->fail($exception->getMessage(), 422);
+        } catch (\Throwable) {
+            return $this->fail('The player file could not be updated.', 502);
+        }
+        $this->activity('server:breefer.players.inventory', ['player' => $name ?: $uuid, 'op' => $op['op'], 'live' => false]);
+
+        return $this->ok(['live' => false, 'message' => 'Saved to the player file. It loads the next time the player joins.']);
+    }
+
+    /** Every item of the server's Minecraft version (from PrismarineJS minecraft-data), cached. */
+    public function itemCatalog(Request $request, Server $server): JsonResponse
+    {
+        $this->authorizeServer($request, $server, Permission::ACTION_FILE_READ_CONTENT);
+        $status = $this->status($server, $this->properties($this->files($server)));
+        preg_match('/\b(\d+\.\d+(?:\.\d+)?)\b/', (string) ($status['version'] ?? ''), $m);
+        $wanted = $m[1] ?? null;
+        $base = 'https://cdn.jsdelivr.net/gh/PrismarineJS/minecraft-data@master/data/';
+
+        try {
+            $paths = Cache::remember('breefer:pm:datapaths', 86400, function () use ($base) {
+                $r = Http::timeout(8)->acceptJson()->get($base.'dataPaths.json');
+
+                return $r->ok() ? $r->json('pc') : null;
+            });
+            if (! is_array($paths)) {
+                throw new \RuntimeException('catalog unavailable');
+            }
+            $versions = array_values(array_filter(array_keys($paths), fn ($v) => preg_match('/^\d+\.\d+(\.\d+)?$/', $v) && isset($paths[$v]['items'])));
+            usort($versions, 'version_compare');
+            $pick = end($versions);
+            if ($wanted) {
+                foreach ($versions as $v) {
+                    if (version_compare($v, $wanted, '<=')) {
+                        $pick = $v;
+                    }
+                }
+            }
+            $items = Cache::remember('breefer:pm:items:'.$pick, 7 * 86400, function () use ($base, $paths, $pick) {
+                $r = Http::timeout(10)->acceptJson()->get($base.$paths[$pick]['items'].'/items.json');
+                if (! $r->ok()) {
+                    return null;
+                }
+
+                return array_values(array_map(fn ($i) => ['id' => 'minecraft:'.$i['name'], 'name' => $i['displayName'] ?? $i['name'], 'stack' => (int) ($i['stackSize'] ?? 64)],
+                    array_filter((array) $r->json(), fn ($i) => is_array($i) && isset($i['name']) && $i['name'] !== 'air')));
+            });
+            if (! is_array($items)) {
+                throw new \RuntimeException('catalog unavailable');
+            }
+        } catch (\Throwable) {
+            return $this->fail('The item list could not be loaded. You can still type an item ID such as minecraft:diamond.', 502);
+        }
+
+        return new JsonResponse(['version' => $pick, 'server_version' => $wanted, 'items' => $items]);
+    }
+
     public function wipe(Request $request, Server $server, string $uuid): JsonResponse
     {
         $this->authorizeServer($request, $server, Permission::ACTION_FILE_DELETE);
@@ -543,7 +956,13 @@ class PlayerController extends BaseController
         $world = $this->world($this->properties($files));
 
         $deleted = [];
-        foreach (["{$world}/playerdata" => ["{$uuid}.dat", "{$uuid}.dat_old"], "{$world}/stats" => ["{$uuid}.json"], "{$world}/advancements" => ["{$uuid}.json"]] as $dir => $names) {
+        $targets = [];
+        foreach ($this->playerDirs($world) as $dirs) {
+            $targets[$dirs['data']] = ["{$uuid}.dat", "{$uuid}.dat_old"];
+            $targets[$dirs['stats']] = ["{$uuid}.json"];
+            $targets[$dirs['advancements']] = ["{$uuid}.json"];
+        }
+        foreach ($targets as $dir => $names) {
             try {
                 $existing = array_map(fn ($f) => $f['name'], $files->getDirectory($dir));
                 $targets = array_values(array_intersect($names, $existing));
@@ -588,6 +1007,8 @@ class PlayerController extends BaseController
                 'amplifier' => $e['amplifier'] ?? ($e['Amplifier'] ?? 0),
                 'duration' => $e['duration'] ?? ($e['Duration'] ?? 0),
             ], $d['active_effects'] ?? ($d['ActiveEffects'] ?? [])),
+            'last_known_name' => $d['bukkit']['lastKnownName'] ?? null,
+            'last_played' => isset($d['bukkit']['lastPlayed']) && is_int($d['bukkit']['lastPlayed']) ? date(DATE_ATOM, intdiv($d['bukkit']['lastPlayed'], 1000)) : null,
             'spawn' => isset($d['SpawnX']) ? [$d['SpawnX'], $d['SpawnY'] ?? 0, $d['SpawnZ'] ?? 0] : (isset($d['respawn']['pos']) && is_array($d['respawn']['pos']) ? $d['respawn']['pos'] : null),
         ];
     }
