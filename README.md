@@ -4,7 +4,7 @@ A player dashboard for Minecraft: live status (ping), online players, operators,
 
 ## Download
 
-The ready-to-install package is [`release/breefer-player-manager-v1.3.0.rext`](release/breefer-player-manager-v1.3.0.rext) (also attached to the GitHub release). Upload it under **Admin → Extensions** in Reviactyl.
+The ready-to-install package is [`release/breefer-player-manager-v1.3.1.rext`](release/breefer-player-manager-v1.3.1.rext) (also attached to the GitHub release). Upload it under **Admin → Extensions** in Reviactyl.
 
 ## Repository layout
 

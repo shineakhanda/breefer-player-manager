@@ -401,7 +401,7 @@ class PlayerController extends BaseController
         // For online players, ask the server to write its player data first so the view is current.
         if ($request->boolean('fresh') && $request->user()->can(Permission::ACTION_CONTROL_CONSOLE, $server)) {
             try {
-                $this->commands($server)->send(['save-all']);
+                $this->runCommands($server, ['save-all']);
                 usleep(1_500_000);
             } catch (\Throwable) {
                 // server offline: the files on disk are already current
@@ -532,7 +532,7 @@ class PlayerController extends BaseController
         }
 
         try {
-            $this->commands($server)->send($commands);
+            $this->runCommands($server, $commands);
         } catch (\Throwable) {
             // Server stopped: list changes can still be made by editing the files the server reads on start.
             if (in_array($data['action'], self::OFFLINE_ACTIONS, true)) {
@@ -607,6 +607,42 @@ class PlayerController extends BaseController
         $this->activity('server:breefer.players.'.$action, ['player' => $name, 'uuid' => $uuid, 'offline' => true]);
 
         return $this->ok(['offline' => true, 'message' => "The server is stopped, so {$file} was updated. The change applies on the next start."]);
+    }
+
+    /**
+     * Bukkit-based servers (Paper, Spigot, Purpur, Folia, hybrids) let plugins replace vanilla
+     * commands: EssentialsX registers its own /item, /give, /tp, /kill, /xp, /gamemode…
+     * Prefixing with "minecraft:" always runs the vanilla command there. Vanilla, Fabric and
+     * Forge servers do not accept the prefix, so it is only added on Bukkit servers.
+     */
+    private function isBukkit(Server $server): bool
+    {
+        return Cache::remember('breefer:pm:bukkit:'.$server->id, 600, function () use ($server) {
+            try {
+                $version = (string) ($this->status($server, $this->properties($this->files($server)))['version'] ?? '');
+            } catch (\Throwable) {
+                $version = '';
+            }
+            if (preg_match('/paper|spigot|purpur|folia|bukkit|pufferfish|leaf|mohist|arclight|magma|canvas|gale/i', $version)) {
+                return true;
+            }
+            try {
+                $this->files($server)->getContent('bukkit.yml', 512 * 1024);
+
+                return true;
+            } catch (\Throwable) {
+                return false;
+            }
+        });
+    }
+
+    /** Sends console commands, routed to the vanilla implementation on Bukkit servers. */
+    private function runCommands(Server $server, array $commands): void
+    {
+        if ($this->isBukkit($server)) {
+            $commands = array_map(fn (string $c) => preg_match('/^[a-z][a-z0-9_-]*:/i', $c) ? $c : 'minecraft:'.$c, $commands);
+        }
+        $this->commands($server)->send($commands);
     }
 
     private function coord(mixed $v): string
@@ -833,7 +869,7 @@ class PlayerController extends BaseController
                 return $this->fail('Editing an online player\'s inventory needs the console permission.', 403);
             }
             try {
-                $this->commands($server)->send(['save-all']); // write current data so slot checks are accurate
+                $this->runCommands($server, ['save-all']); // write current data so slot checks are accurate
             } catch (\Throwable) {
                 return $this->fail('The server stopped responding. Try again in a moment.', 409);
             }
@@ -859,7 +895,7 @@ class PlayerController extends BaseController
             }
             if ($commands) {
                 try {
-                    $this->commands($server)->send([...$commands, 'save-all']);
+                    $this->runCommands($server, [...$commands, 'save-all']);
                 } catch (\Throwable) {
                     return $this->fail('The commands could not be sent. Is the server still running?', 409);
                 }
